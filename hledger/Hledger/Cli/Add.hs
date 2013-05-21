@@ -160,9 +160,10 @@ getPostingsForTransactionWithHistory j opts datestr code description comment def
   when (isJust bestmatch) $ liftIO $ hPrintf stderr "\nUsing this existing transaction for defaults:\n%s" (show $ fromJust bestmatch)
   getvalidpostings `E.catch` \(_::RestartEntryException) -> return Nothing
 
--- | get suggested accounts from journal based on entered account.
+-- | take all accounts, that occur in the journal in transactions,
+--   that start with the entered account
 getSuggestedAccounts :: Journal -> AccountName -> [SugAccount]
-getSuggestedAccounts j account = fmap y $ groupBy (==) $ sort matches
+getSuggestedAccounts j account = fmap y $ group $ sort matches
   where y x = SugAccount { saUsed=False, saFreq=length x, saName="asd"++head x}
         matches :: [AccountName]
         matches = do accs <- (fmap (fmap paccount . tpostings) $ jtxns j)
@@ -172,8 +173,8 @@ getSuggestedAccounts j account = fmap y $ groupBy (==) $ sort matches
         f x = not $ x `elem` [account]
         
 -- | mark account as already used
-markSuggestedAccounts :: AccountName -> [SugAccount] -> [SugAccount]
-markSuggestedAccounts account accounts = fmap y accounts
+markSuggestedAccount :: AccountName -> [SugAccount] -> [SugAccount]
+markSuggestedAccount account accounts = fmap y accounts
   where y sa@(SugAccount{saName = san }) =
           if san == account then sa{saUsed=True}
             else sa
@@ -181,13 +182,13 @@ markSuggestedAccounts account accounts = fmap y accounts
 data SugAccount = SugAccount { saUsed :: Bool ,
                                saName :: AccountName,
                                saFreq :: Int }
-                  
-unusedSA name = SugAccount { saUsed = False, saName = name }
+                deriving Show
 
 -- | get suggested account not yet used
 getUnusedSuggestedAccount ::  [SugAccount] -> AccountName
 getUnusedSuggestedAccount = saName . head . (filter $ not . saUsed)
-  
+
+                            
   
 -- | Read postings from the command line until . is entered, generating
 -- useful defaults based on historical context and postings entered so far.
@@ -195,11 +196,13 @@ getPostingsLoop :: PostingsState -> [Posting] -> [String] -> IO [Posting]
 getPostingsLoop st enteredps defargs = do
   let bestmatchAcc Nothing = do  ps <- historicalps  
                                  fmap showacctname $ listToMaybe (drop (n-1) ps)
-      bestmatchAcc sa = fmap getUnusedSuggestedAccount sa
-      defacct  = maybe (bestmatchAcc $ psSuggestedAccounts st) Just $ headMay defargs
+      bestmatchAcc sac = fmap getUnusedSuggestedAccount sac
+      sac = psSuggestedAccounts st
+      defacct  = maybe (bestmatchAcc sac) Just $ headMay defargs
       defargs' = tailDef [] defargs
       ordot | null enteredps || length enteredrealps == 1 = "" :: String
             | otherwise = " (or . to complete this transaction)"
+  when (isJust sac) $ print $ show sac
   account <- runInteraction j $ askFor (printf "account %d%s" n ordot) defacct (Just accept)
   when (account=="<") $ throwIO RestartEntryException
   if account=="."
@@ -250,7 +253,7 @@ getPostingsLoop st enteredps defargs = do
                  else st{psHistory=historicalps', psSuggestHistoricalAmount=False}
           st'' = st'{psSuggestedAccounts = Just
                         (maybe (getSuggestedAccounts (psJournal st') account)
-                               (markSuggestedAccounts account)
+                               (markSuggestedAccount account)
                         $ psSuggestedAccounts st')}
       when (isJust defcommodityadded) $
            liftIO $ hPutStrLn stderr $ printf "using default commodity (%s)" (fromJust defcommodityadded)
