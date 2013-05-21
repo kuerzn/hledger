@@ -125,6 +125,7 @@ data PostingsState = PostingsState {
   ,psAccept                  :: AccountName -> Bool
   ,psSuggestHistoricalAmount :: Bool
   ,psHistory                 :: Maybe [Posting]
+  ,psSuggestedAccounts       :: Maybe [SugAccount]
   }
 
 -- | Loop reading postings from the console, until a valid balanced
@@ -144,7 +145,7 @@ getPostingsForTransactionWithHistory j opts datestr code description comment def
             else True
       existingaccts = journalAccountNames j
       getvalidpostings = do
-        ps <- getPostingsLoop (PostingsState j accept True bestmatchpostings) [] defargs
+        ps <- getPostingsLoop (PostingsState j accept True bestmatchpostings Nothing) [] defargs
         let t = nulltransaction{tdate=date
                                ,tstatus=False
                                ,tcode=code
@@ -159,16 +160,43 @@ getPostingsForTransactionWithHistory j opts datestr code description comment def
   when (isJust bestmatch) $ liftIO $ hPrintf stderr "\nUsing this existing transaction for defaults:\n%s" (show $ fromJust bestmatch)
   getvalidpostings `E.catch` \(_::RestartEntryException) -> return Nothing
 
+-- | get suggested accounts from journal based on entered account.
+getSuggestedAccounts :: Journal -> AccountName -> [SugAccount]
+getSuggestedAccounts j account = fmap y $ groupBy (==) $ sort matches
+  where y x = SugAccount { saUsed=False, saFreq=length x, saName="asd"++head x}
+        matches :: [AccountName]
+        matches = do accs <- (fmap (fmap paccount . tpostings) $ jtxns j)
+                     if account `elem` accs
+                       then filter f accs
+                       else []
+        f x = not $ x `elem` [account]
+        
+-- | mark account as already used
+markSuggestedAccounts :: AccountName -> [SugAccount] -> [SugAccount]
+markSuggestedAccounts account accounts = fmap y accounts
+  where y sa@(SugAccount{saName = san }) =
+          if san == account then sa{saUsed=True}
+            else sa
+
+data SugAccount = SugAccount { saUsed :: Bool ,
+                               saName :: AccountName,
+                               saFreq :: Int }
+                  
+unusedSA name = SugAccount { saUsed = False, saName = name }
+
+-- | get suggested account not yet used
+getUnusedSuggestedAccount ::  [SugAccount] -> AccountName
+getUnusedSuggestedAccount = saName . head . (filter $ not . saUsed)
+  
+  
 -- | Read postings from the command line until . is entered, generating
 -- useful defaults based on historical context and postings entered so far.
 getPostingsLoop :: PostingsState -> [Posting] -> [String] -> IO [Posting]
 getPostingsLoop st enteredps defargs = do
-  let bestmatch | isNothing historicalps = Nothing
-                | n <= length ps = Just $ ps !! (n-1)
-                | otherwise = Nothing
-                where Just ps = historicalps
-      bestmatchacct = maybe Nothing (Just . showacctname) bestmatch
-      defacct  = maybe bestmatchacct Just $ headMay defargs
+  let bestmatchAcc Nothing = do  ps <- historicalps  
+                                 fmap showacctname $ listToMaybe (drop (n-1) ps)
+      bestmatchAcc sa = fmap getUnusedSuggestedAccount sa
+      defacct  = maybe (bestmatchAcc $ psSuggestedAccounts st) Just $ headMay defargs
       defargs' = tailDef [] defargs
       ordot | null enteredps || length enteredrealps == 1 = "" :: String
             | otherwise = " (or . to complete this transaction)"
@@ -220,9 +248,13 @@ getPostingsLoop st enteredps defargs = do
           st' = if wasdefamtused
                  then st
                  else st{psHistory=historicalps', psSuggestHistoricalAmount=False}
+          st'' = st'{psSuggestedAccounts = Just
+                        (maybe (getSuggestedAccounts (psJournal st') account)
+                               (markSuggestedAccounts account)
+                        $ psSuggestedAccounts st')}
       when (isJust defcommodityadded) $
            liftIO $ hPutStrLn stderr $ printf "using default commodity (%s)" (fromJust defcommodityadded)
-      getPostingsLoop st' (enteredps ++ [p]) defargs''
+      getPostingsLoop st'' (enteredps ++ [p]) defargs''
     where
       j = psJournal st
       historicalps = psHistory st
