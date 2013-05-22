@@ -13,14 +13,14 @@ module Hledger.Cli.Add
 where
 import Control.Exception as E
 import Control.Monad
-import Control.Applicative ((<$>))
+import Control.Applicative ((<$>),(<*>),liftA2)
 import Control.Monad.Trans (liftIO)
 import Data.Char (toUpper, toLower)
 import Data.List
 import Data.Ord
 import Data.Maybe
 import Data.Typeable (Typeable)
-import Safe (headDef, tailDef, headMay)
+import Safe (headDef, tailDef, headMay, atMay)
 import System.Console.Haskeline (InputT, runInputT, defaultSettings, setComplete, getInputLine)
 import System.Console.Haskeline.Completion
 import System.IO ( stderr, hPutStr, hPutStrLn )
@@ -35,6 +35,8 @@ import Hledger.Utils.UTF8IOCompat (putStr, putStrLn, appendFile)
 import Hledger.Cli.Options
 import Hledger.Cli.Register (postingsReportAsText)
 
+main = do  ej <- readJournalFile Nothing Nothing "/home/data/finanzen/jo/main.dat"
+           either error (add defcliopts) ej
 
 -- | Read multiple transactions from the console, prompting for each
 -- field, and append them to the journal file.  If the journal came
@@ -127,7 +129,7 @@ data PostingsState = PostingsState {
   ,psAccept                  :: AccountName -> Bool
   ,psSuggestHistoricalAmount :: Bool
   ,psHistory                 :: Maybe [Posting]
-  ,psSuggestedAccounts       :: Maybe [SugAccount]
+  ,psSuggestedAccounts       :: Maybe SugAccounts
   }
 
 -- | Loop reading postings from the console, until a valid balanced
@@ -164,11 +166,11 @@ getPostingsForTransactionWithHistory j opts datestr code description comment def
 
 -- | take all accounts, that occur in the journal in transactions,
 --   that start with the entered account
-getSuggestedAccounts :: Journal -> AccountName -> [SugAccount]
+getSuggestedAccounts :: Journal -> AccountName -> SugAccounts
 getSuggestedAccounts j account =  sortBy (flip $ comparing saFreq) $ y <$> (group $ sort matches)
-  where y x = SugAccount { saUsed=False, saFreq=length x, saName=head x}
+  where y x = SugAccount { saAmount=Nothing, saFreq=length x, saName=head x}
         matches = filter g $ concat $ filter f $ ((paccount<$>) . tpostings) <$> jtxns j
-        f = (account==) . head
+        f = liftA2 (&&) ((account==) . head ) (not . null)
         g = (account/=)
 -- getSuggestedAccounts j account = fmap y $ group $ sort matches
 --   where y x = SugAccount { saUsed=False, saFreq=length x, saName="asd"++head x}
@@ -178,42 +180,54 @@ getSuggestedAccounts j account =  sortBy (flip $ comparing saFreq) $ y <$> (grou
 --                        then filter f accs
 --                        else []
 --         f x = not $ x `elem` [account]
+
+type SugAccounts = [SugAccount]
         
 -- | mark account as already used
-markSuggestedAccount :: AccountName -> [SugAccount] -> [SugAccount]
-markSuggestedAccount account accounts = fmap y accounts
+markSuggestedAccount :: AccountName -> Amount -> SugAccounts -> SugAccounts
+markSuggestedAccount account amount accounts = fmap y accounts
   where y sa@(SugAccount{saName = san }) =
-          if san == account then sa{saUsed=True}
+          if san == account then sa{saAmount = Just amount}
             else sa
 
-data SugAccount = SugAccount { saUsed :: Bool ,
+data SugAccount = SugAccount { saAmount :: Maybe Amount ,
                                saName :: AccountName,
                                saFreq :: Int }
 
 -- | get suggested account not yet used
-getUnusedSuggestedAccount ::  [SugAccount] -> AccountName
-getUnusedSuggestedAccount = saName . head . (filter $ not . saUsed)
+getUnusedSuggestedAccount ::  SugAccounts -> Maybe AccountName
+getUnusedSuggestedAccount = headMay . (saName<$>) . (filter $ isNothing . saAmount)
 
 -- | display suggested accounts
-displaySuggs Nothing = return ()
-displaySuggs (Just a)  = putStrLn $ "\n"++renderTable (replicate 4 center,replicate 4 left,
-                                                 [ "No.",  "Account",  "Used", "Frequency"])
-                         [ [show n,saName x, if saUsed x then "x" else "", show $ saFreq x] | (x,n) <- zip a [1..] ]
-                            
+displaySuggs _ Nothing = return ()
+displaySuggs _ (Just []) = return ()
+displaySuggs ps (Just a)  = do
+  putStrLn $ "\n"++renderTable (replicate 4 center,replicate 4 left,
+                                [ "No.",  "Account",  "Used", "Frequency"])
+    [ [show n,
+       saName x,
+       maybe "" showAmount $ saAmount x,
+       show $ saFreq x] | (x,n) <- zip a [1..] ]
+  putStrLn $ concatMap show ps
+
+-- | Use "SecondArg", if FirstArg is nothing
+maybeDefault :: Maybe a -> Maybe a -> Maybe a
+maybeDefault Nothing = id
+maybeDefault a = const a
   
 -- | Read postings from the command line until . is entered, generating
 -- useful defaults based on historical context and postings entered so far.
 getPostingsLoop :: PostingsState -> [Posting] -> [String] -> IO [Posting]
 getPostingsLoop st enteredps defargs = do
-  let bestmatchAcc Nothing = do  ps <- historicalps  
-                                 fmap showacctname $ listToMaybe (drop (n-1) ps)
-      bestmatchAcc sac = fmap getUnusedSuggestedAccount sac
-      sac = psSuggestedAccounts st
-      defacct  = maybe (bestmatchAcc sac) Just $ headMay defargs
+  let sac = psSuggestedAccounts st
+      defacct  = maybeDefault (getUnusedSuggestedAccount =<< sac) $ 
+                 maybeDefault (do {ps <- historicalps;
+                                  fmap showacctname $ atMay ps $ n-1 }) $
+                 headMay defargs
       defargs' = tailDef [] defargs
       ordot | null enteredps || length enteredrealps == 1 = "" :: String
             | otherwise = " (or . to complete this transaction)"
-  displaySuggs sac
+  displaySuggs enteredps sac
   account <- runInteraction j $ askFor (printf "account %d%s" n ordot) defacct (Just accept)
   when (account=="<") $ throwIO RestartEntryException
   if account=="."
@@ -264,7 +278,7 @@ getPostingsLoop st enteredps defargs = do
                  else st{psHistory=historicalps', psSuggestHistoricalAmount=False}
           st'' = st'{psSuggestedAccounts = Just
                         (maybe (getSuggestedAccounts (psJournal st') account)
-                               (markSuggestedAccount account)
+                               (markSuggestedAccount account a)
                         $ psSuggestedAccounts st')}
       when (isJust defcommodityadded) $
            liftIO $ hPutStrLn stderr $ printf "using default commodity (%s)" (fromJust defcommodityadded)
