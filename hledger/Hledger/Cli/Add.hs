@@ -13,9 +13,11 @@ module Hledger.Cli.Add
 where
 import Control.Exception as E
 import Control.Monad
+import Control.Applicative ((<$>))
 import Control.Monad.Trans (liftIO)
 import Data.Char (toUpper, toLower)
 import Data.List
+import Data.Ord
 import Data.Maybe
 import Data.Typeable (Typeable)
 import Safe (headDef, tailDef, headMay)
@@ -163,14 +165,19 @@ getPostingsForTransactionWithHistory j opts datestr code description comment def
 -- | take all accounts, that occur in the journal in transactions,
 --   that start with the entered account
 getSuggestedAccounts :: Journal -> AccountName -> [SugAccount]
-getSuggestedAccounts j account = fmap y $ group $ sort matches
-  where y x = SugAccount { saUsed=False, saFreq=length x, saName="asd"++head x}
-        matches :: [AccountName]
-        matches = do accs <- (fmap (fmap paccount . tpostings) $ jtxns j)
-                     if account `elem` accs
-                       then filter f accs
-                       else []
-        f x = not $ x `elem` [account]
+getSuggestedAccounts j account =  sortBy (flip $ comparing saFreq) $ y <$> (group $ sort matches)
+  where y x = SugAccount { saUsed=False, saFreq=length x, saName=head x}
+        matches = filter g $ concat $ filter f $ ((paccount<$>) . tpostings) <$> jtxns j
+        f = (account==) . head
+        g = (account/=)
+-- getSuggestedAccounts j account = fmap y $ group $ sort matches
+--   where y x = SugAccount { saUsed=False, saFreq=length x, saName="asd"++head x}
+--         matches :: [AccountName]
+--         matches = do accs <- (fmap (fmap paccount . tpostings) $ jtxns j)
+--                      if account `elem` accs
+--                        then filter f accs
+--                        else []
+--         f x = not $ x `elem` [account]
         
 -- | mark account as already used
 markSuggestedAccount :: AccountName -> [SugAccount] -> [SugAccount]
@@ -182,12 +189,16 @@ markSuggestedAccount account accounts = fmap y accounts
 data SugAccount = SugAccount { saUsed :: Bool ,
                                saName :: AccountName,
                                saFreq :: Int }
-                deriving Show
 
 -- | get suggested account not yet used
 getUnusedSuggestedAccount ::  [SugAccount] -> AccountName
 getUnusedSuggestedAccount = saName . head . (filter $ not . saUsed)
 
+-- | display suggested accounts
+displaySuggs Nothing = return ()
+displaySuggs (Just a)  = putStrLn $ "\n"++renderTable (replicate 4 center,replicate 4 left,
+                                                 [ "No.",  "Account",  "Used", "Frequency"])
+                         [ [show n,saName x, if saUsed x then "x" else "", show $ saFreq x] | (x,n) <- zip a [1..] ]
                             
   
 -- | Read postings from the command line until . is entered, generating
@@ -202,7 +213,7 @@ getPostingsLoop st enteredps defargs = do
       defargs' = tailDef [] defargs
       ordot | null enteredps || length enteredrealps == 1 = "" :: String
             | otherwise = " (or . to complete this transaction)"
-  when (isJust sac) $ print $ show sac
+  displaySuggs sac
   account <- runInteraction j $ askFor (printf "account %d%s" n ordot) defacct (Just accept)
   when (account=="<") $ throwIO RestartEntryException
   if account=="."
@@ -393,3 +404,34 @@ capitalize (c:cs) = toUpper c : cs
 headTailDef :: a -> [a] -> (a,[a])
 headTailDef defhead as = (headDef defhead as, tailDef [] as)
 
+
+-- Pretty Printer START
+
+-- a type for fill functions
+type Filler = Int -> String -> String
+
+-- functions that fill a string (s) to a given width (n) by adding pad
+-- character (c) to align left, right, or center
+fillLeft c n s = s ++ replicate (n - length s) c
+fillRight c n s = replicate (n - length s) c ++ s
+fillCenter c n s = replicate l c ++ s ++ replicate r c
+    where x = n - length s
+          l = x `div` 2
+          r = x - l
+
+-- functions that fill with spaces
+left = fillLeft ' '
+right = fillRight ' '
+center = fillCenter ' '
+
+-- converts a list of items into a table according to a list
+-- of column descriptors
+renderTable :: ([Filler],[Filler],[String]) -> [[String]] -> String
+renderTable (headerFill,rowFill,header) rows =
+    let widths = [maximum $ map length col | col <- transpose $ header : rows]
+        separator = intercalate "-+-" [replicate width '-' | width <- widths]
+        fillCols fill cols = intercalate " | " $ zipWith3 (($).) fill widths cols
+    in
+        unlines $ fillCols headerFill header : separator : map (fillCols rowFill) rows
+
+-- Pretty Printer END        
